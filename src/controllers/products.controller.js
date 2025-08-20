@@ -95,10 +95,13 @@ export const addProduct = async (req, res, next) => {
 
 export const listProducts = async (req, res, next) => {
   try {
-    const [rows] = await pool.query(`SELECT * FROM products ORDER BY id DESC`);
+    const [rows] = await pool.query(
+      `SELECT * FROM products WHERE is_deleted = 0 ORDER BY id DESC`
+    );
     res.json({ status:true, data: rows });
   } catch (e) { next(e); }
 };
+
 
 export const getProduct = async (req, res, next) => {
   try {
@@ -112,21 +115,22 @@ export const updateProduct = async (req, res, next) => {
   const id = Number(req.params.id);
   if (!id) return next(badReq('id invalid'));
 
-  const {
-    name, sku, category, unit_name,
-    pack_size, wholesale_price_per_pack, retail_price_per_unit,
-    stock_units, min_stock_units, max_stock_units
-  } = req.body;
-
   try {
-    // Ambil nilai lama (untuk cek apakah threshold/stock berubah)
+    // Ambil data lama (sekalian untuk cek perubahan stok/threshold)
     const [[old]] = await pool.query(
-      `SELECT id, stock_units, min_stock_units, max_stock_units FROM products WHERE id=?`,
+      `SELECT id, image_url, stock_units, min_stock_units, max_stock_units FROM products WHERE id=?`,
       [id]
     );
     if (!old) throw badReq('Produk tidak ditemukan');
 
-    // Build SET dinamis
+    const {
+      name, sku, category, unit_name,
+      pack_size, wholesale_price_per_pack, retail_price_per_unit,
+      stock_units, min_stock_units, max_stock_units,
+      remove_image // "1" untuk hapus gambar
+    } = req.body;
+
+    // Kumpulkan field yang mau diupdate
     const fields = [];
     const vals = [];
     const setIf = (col, val) => { if (val !== undefined) { fields.push(`${col}=?`); vals.push(val); } };
@@ -142,7 +146,20 @@ export const updateProduct = async (req, res, next) => {
     setIf('min_stock_units', min_stock_units);
     setIf('max_stock_units', max_stock_units);
 
-    if (!fields.length) return res.json({ status:true, message:'no changes' });
+    // === handle image ===
+    // jika ada file baru dari Cloudinary (multer-storage-cloudinary), req.file.path = URL
+    if (req.file?.path) {
+      setIf('image_url', req.file.path);
+    } else if (String(remove_image||'') === '1') {
+      setIf('image_url', null);
+      // (opsional) kalau kamu simpan public_id, di sini bisa sekalian cloudinary.uploader.destroy(public_id)
+    }
+
+    if (!fields.length) {
+      // tidak ada perubahan
+      const [[fresh]] = await pool.query(`SELECT * FROM products WHERE id=?`, [id]);
+      return res.json({ status:true, message:'no changes', data: fresh });
+    }
 
     fields.push('updated_at=NOW()');
     const sql = `UPDATE products SET ${fields.join(', ')} WHERE id=?`;
@@ -150,22 +167,33 @@ export const updateProduct = async (req, res, next) => {
 
     await pool.query(sql, vals);
 
-    res.json({ status:true, message:'updated' });
+    // Ambil data terbaru untuk response
+    const [[updated]] = await pool.query(`SELECT * FROM products WHERE id=?`, [id]);
 
-    // Jika ada perubahan pada stok/min/max → cek & kirim WA (status-change aware)
+    res.json({ status:true, message:'updated', data: updated });
+
+    // Jika ada perubahan stok/min/max → cek & kirim WA
     const changedThresholdOrStock =
       stock_units !== undefined || min_stock_units !== undefined || max_stock_units !== undefined;
 
     if (changedThresholdOrStock) {
       try { await notifyAdminsStockStatus(id); } catch (e) { console.error('WA stok error:', e.message); }
     }
-
   } catch (e) { next(e); }
 };
 
 export const deleteProduct = async (req, res, next) => {
   try {
-    const [result] = await pool.query(`DELETE FROM products WHERE id=?`, [req.params.id]);
-    res.json({ status:true, affectedRows: result.affectedRows });
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ status:false, message:'id invalid' });
+
+    // Pastikan produk ada & belum dihapus
+    const [[prod]] = await pool.query(`SELECT id, is_deleted FROM products WHERE id=?`, [id]);
+    if (!prod) return res.status(404).json({ status:false, message:'Produk tidak ditemukan' });
+    if (prod.is_deleted) return res.json({ status:true, message:'Produk sudah diarsipkan' });
+
+    // Arsipkan
+    await pool.query(`UPDATE products SET is_deleted=1, deleted_at=NOW() WHERE id=?`, [id]);
+    res.json({ status:true, message:'Produk diarsipkan (soft delete)' });
   } catch (e) { next(e); }
 };

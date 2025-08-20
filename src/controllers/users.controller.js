@@ -10,6 +10,40 @@ const badReq = (msg) => {
   return err;
 };
 
+function canChange(reqUser, targetUserId) {
+  if (!reqUser) return false;
+  if (reqUser.role === 'admin') return true;
+  return Number(reqUser.id) === Number(targetUserId);
+}
+
+export const changePassword = async (req, res, next) => {
+  try {
+    const targetId = Number(req.params.id);
+    const { password } = req.body;
+
+    if (!targetId) throw BADREQ('User id invalid');
+    if (!password || String(password).length < 6) {
+      throw BADREQ('Password minimal 6 karakter');
+    }
+    if (!canChange(req.user, targetId)) {
+      const e = new Error('Forbidden'); e.statusCode = 403; throw e;
+    }
+
+    // pastikan user ada
+    const [[u]] = await pool.query(`SELECT id FROM users WHERE id=?`, [targetId]);
+    if (!u) { const e = new Error('User tidak ditemukan'); e.statusCode = 404; throw e; }
+
+    const hash = await bcrypt.hash(String(password), 10);
+
+    await pool.query(
+      `UPDATE users SET password_hash=?, updated_at=NOW() WHERE id=?`,
+      [hash, targetId]
+    );
+
+    res.json({ status:true, message:'Password berhasil diperbarui' });
+  } catch (e) { next(e); }
+};
+
 export const listUsers = async (req, res, next) => {
   try {
     const search = (req.query.search || '').trim();

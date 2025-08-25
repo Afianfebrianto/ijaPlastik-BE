@@ -21,62 +21,103 @@ export const cashierReport = async (req, res, next) => {
     const df = req.query.date_from;
     const dt = req.query.date_to;
     const cashierId = req.query.cashier_id ? Number(req.query.cashier_id) : null;
-    const page = Math.max(1, parseInt(req.query.page || '1', 10));
+
+    const page  = Math.max(1, parseInt(req.query.page  || '1', 10));
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
     const offset = (page - 1) * limit;
 
-    if (!df || !dt) return res.status(400).json({ status:false, message:'date_from dan date_to wajib' });
+    if (!df || !dt) {
+      return res.status(400).json({ status: false, message: 'date_from dan date_to wajib' });
+    }
 
-    const where = [`s.created_at BETWEEN ? AND ?`];
+    // WHERE & args
+    const whereParts = ['s.created_at BETWEEN ? AND ?'];
     const args = [`${df} 00:00:00`, `${dt} 23:59:59`];
-    if (cashierId) { where.push(`s.cashier_id = ?`); args.push(cashierId); }
-    const whereSql = 'WHERE ' + where.join(' AND ');
+    if (cashierId) { whereParts.push('s.cashier_id = ?'); args.push(cashierId); }
+    const whereSql = 'WHERE ' + whereParts.join(' AND ');
 
-    // Detail baris per transaksi (dengan agregat item_count & units_sold)
+    // --- DATA BARIS: agregat per transaksi ---
+    // Catatan: COUNT(DISTINCT si.id) untuk jaga-jaga; SUM units_sold per sale
     const [rows] = await pool.query(
-  `SELECT s.id, s.receipt_no, s.created_at, s.payment_method,
-          s.subtotal, s.total,
-          u.name AS cashier_name,
-          COUNT(si.id) AS item_count,
-          COALESCE(SUM(CASE WHEN si.item_type='pack' 
-              THEN si.qty * p.pack_size ELSE si.qty END),0) AS units_sold
-   FROM sales s
-   JOIN users u ON u.id = s.cashier_id
-   LEFT JOIN sale_items si ON si.sale_id = s.id
-   LEFT JOIN products p ON p.id = si.product_id
-   ${whereSql}
-   GROUP BY s.id
-   ORDER BY s.created_at DESC
-   LIMIT ? OFFSET ?`,
-  [...args, limit, offset]
-);
+      `SELECT
+         s.id,
+         s.receipt_no,
+         s.created_at,
+         s.payment_method,
+         s.subtotal,
+         s.total,
+         u.name AS cashier_name,
+         COUNT(DISTINCT si.id) AS item_count,
+         COALESCE(SUM(CASE WHEN si.item_type = 'pack'
+                           THEN si.qty * p.pack_size ELSE si.qty END), 0) AS units_sold
+       FROM sales s
+       JOIN users u       ON u.id = s.cashier_id
+       LEFT JOIN sale_items si ON si.sale_id = s.id
+       LEFT JOIN products   p  ON p.id      = si.product_id
+       ${whereSql}
+       GROUP BY s.id
+       ORDER BY s.created_at DESC
+       LIMIT ? OFFSET ?`,
+      [...args, limit, offset]
+    );
 
-    // Ringkasan total
-    const [sumRows] = await pool.query(
-  `SELECT COUNT(DISTINCT s.id) AS trx,
-          COALESCE(SUM(s.subtotal),0) AS subtotal,
-          COALESCE(SUM(s.total),0) AS omzet,
-          COALESCE(SUM(CASE WHEN si.item_type='pack' 
-              THEN si.qty * p.pack_size ELSE si.qty END),0) AS units_sold
-   FROM sales s
-   LEFT JOIN sale_items si ON si.sale_id = s.id
-   LEFT JOIN products p ON p.id = si.product_id
-   ${whereSql}`,
-  args
-);
-    const summary = sumRows[0];
+    // --- SUMMARY: pisahkan uang (tanpa join) & units (dengan join) ---
+    // 1) uang & trx dari sales saja
+    const [moneyRows] = await pool.query(
+      `SELECT
+         COUNT(*) AS trx,
+         COALESCE(SUM(s.subtotal), 0) AS subtotal,
+         COALESCE(SUM(s.total),    0) AS omzet
+       FROM sales s
+       ${whereSql}`,
+      args
+    );
+    const money = moneyRows[0] || { trx: 0, subtotal: 0, omzet: 0 };
 
-    // total untuk pagination (jumlah transaksi)
+    // 2) units_sold dari join sale_items/products
+    const [unitsRows] = await pool.query(
+      `SELECT COALESCE(SUM(
+                 CASE WHEN si.item_type = 'pack'
+                      THEN si.qty * p.pack_size ELSE si.qty END
+               ), 0) AS units_sold
+       FROM sales s
+       LEFT JOIN sale_items si ON si.sale_id = s.id
+       LEFT JOIN products   p  ON p.id      = si.product_id
+       ${whereSql}`,
+      args
+    );
+    const units_sold = unitsRows[0]?.units_sold ?? 0;
+
+    const summary = {
+      trx:        Number(money.trx) || 0,
+      subtotal:   Number(money.subtotal) || 0,
+      omzet:      Number(money.omzet) || 0,
+      units_sold: Number(units_sold) || 0,
+    };
+
+    // --- TOTAL untuk pagination (jumlah transaksi) ---
     const [[{ total_trx }]] = await pool.query(
       `SELECT COUNT(*) AS total_trx
        FROM sales s
-       ${whereSql.replace('JOIN users u ON u.id = s.cashier_id','')} -- safe, we didn't include that join here`,
+       ${whereSql}`,
       args
     );
 
-    res.json({ status:true, data: rows, summary, page, limit, total: total_trx });
-  } catch (e) { next(e); }
+    // (opsional) normalisasi DECIMAL string di rows -> number
+    const data = rows.map(r => ({
+      ...r,
+      subtotal: Number(r.subtotal),
+      total:    Number(r.total),
+      units_sold: Number(r.units_sold),
+      item_count: Number(r.item_count),
+    }));
+
+    res.json({ status: true, data, summary, page, limit, total: Number(total_trx) || 0 });
+  } catch (e) {
+    next(e);
+  }
 };
+
 
 // GET /reports/cashier.csv?date_from=...&date_to=...&cashier_id=#
 export const cashierReportCsv = async (req, res, next) => {

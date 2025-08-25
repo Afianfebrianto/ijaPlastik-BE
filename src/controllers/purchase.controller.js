@@ -268,3 +268,123 @@ export const listAllPOs = async (req, res, next) => {
 };
 
 
+export const getPurchaseReceiveDetail = async (req, res, next) => {
+  try {
+    const poId = Number(req.params.id);
+    if (!poId) return res.status(400).json({ status:false, message:'id invalid' });
+
+    // --- Header PO
+    const [[purchase]] = await pool.query(
+      `SELECT 
+         po.id, po.code, po.status, po.created_at,
+         s.name AS supplier_name
+       FROM purchase_orders po
+       JOIN suppliers s ON s.id = po.supplier_id
+       WHERE po.id = ?`,
+      [poId]
+    );
+    if (!purchase) {
+      return res.status(404).json({ status:false, message:'PO tidak ditemukan' });
+    }
+
+    // --- Semua GRN untuk PO ini
+    const [grns] = await pool.query(
+      `SELECT 
+         gr.id,
+         gr.received_at,
+         gr.note,
+         u.name AS received_by_name
+       FROM grn_receipts gr
+       JOIN users u ON u.id = gr.received_by
+       WHERE gr.purchase_order_id = ?
+       ORDER BY gr.received_at ASC, gr.id ASC`,
+      [poId]
+    );
+
+    // Jika belum ada GRN, kembalikan header saja
+    if (!grns.length) {
+      return res.json({
+        status: true,
+        purchase,
+        grns: [] // tidak ada penerimaan
+      });
+    }
+
+    // --- Item per GRN (tanpa IN clause ribet, filter via join ke grn_receipts)
+    const [grnItems] = await pool.query(
+      `SELECT
+         gr.id AS grn_receipt_id,
+         p.id AS product_id,
+         p.name AS product_name,
+         p.pack_size,
+         gri.qty_pack,
+         (gri.qty_pack * p.pack_size) AS qty_units
+       FROM grn_receipt_items gri
+       JOIN grn_receipts gr ON gr.id = gri.grn_receipt_id
+       JOIN products p ON p.id = gri.product_id
+       WHERE gr.purchase_order_id = ?
+       ORDER BY gr.received_at ASC, gri.id ASC`,
+      [poId]
+    );
+
+    const [receivedSummary] = await pool.query(
+  `SELECT
+     poi.id AS purchase_item_id,
+     poi.product_id,
+     p.name AS product_name,
+     poi.qty_pack AS ordered_qty_pack,
+     COALESCE(SUM(gri.qty_pack), 0) AS received_qty_pack
+   FROM purchase_order_items poi
+   JOIN products p ON p.id = poi.product_id
+   LEFT JOIN grn_receipts gr ON gr.purchase_order_id = poi.purchase_order_id
+   LEFT JOIN grn_receipt_items gri 
+          ON gri.grn_receipt_id = gr.id
+         AND gri.product_id = poi.product_id
+   WHERE poi.purchase_order_id = ?
+   GROUP BY poi.id, poi.product_id, p.name, poi.qty_pack
+   ORDER BY poi.id ASC`,
+  [poId]
+);
+
+    // Kelompokkan item berdasarkan GRN
+    const itemMap = new Map();
+    for (const it of grnItems) {
+      const arr = itemMap.get(it.grn_receipt_id) || [];
+      arr.push({
+        product_id: it.product_id,
+        product_name: it.product_name,
+        pack_size: Number(it.pack_size),
+        qty_pack: Number(it.qty_pack),
+        qty_units: Number(it.qty_units)
+      });
+      itemMap.set(it.grn_receipt_id, arr);
+    }
+
+    // Susun output GRN lengkap dengan items
+    const grnWithItems = grns.map(g => ({
+      id: g.id,
+      received_at: g.received_at,
+      received_by_name: g.received_by_name,
+      note: g.note,
+      items: itemMap.get(g.id) || []
+    }));
+
+    res.json({
+      status: true,
+      purchase,
+      grns: grnWithItems,
+      summary_items: receivedSummary.map(r => ({
+    purchase_item_id: r.purchase_item_id,
+    product_id: r.product_id,
+    product_name: r.product_name,
+    ordered_qty_pack: Number(r.ordered_qty_pack),
+    received_qty_pack: Number(r.received_qty_pack),
+    remaining_qty_pack: Math.max(0, Number(r.ordered_qty_pack) - Number(r.received_qty_pack))
+  }))
+    });
+  } catch (e) {
+    next(e);
+  }
+};
+
+

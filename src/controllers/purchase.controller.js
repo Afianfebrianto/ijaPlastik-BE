@@ -3,6 +3,7 @@ import { pool } from '../db.js';
 // import { notifyAdminsStockStatus } from '../utils/stockAlerts.js';
 
 import { notifyAdminsStockStatus } from '../services/stockAlert.service.js';
+import { sendPONotification } from '../utils/alertSupply.js';
 
 const badReq = (m)=>{ const e=new Error(m); e.statusCode=400; return e; };
 
@@ -15,7 +16,7 @@ export const createPO = async (req, res, next) => {
     const [po] = await conn.query(
       `INSERT INTO purchase_orders (code, supplier_id, requested_by, status, note)
        VALUES (?,?,?,?,?)`,
-      [code, supplier_id, req.user.id, 'draft', note || null]
+      [code, supplier_id, req.user.id, 'sent', note || null]
     );
     for (const it of items) {
       await conn.query(
@@ -25,6 +26,61 @@ export const createPO = async (req, res, next) => {
       );
     }
     await conn.commit();
+     // === Kirim WA ke supplier (AFTER COMMIT) ===
+    try {
+      // Ambil nomor & nama supplier
+      const [[supplier]] = await pool.query(
+        `SELECT name, phone FROM suppliers WHERE id=?`, [supplier_id]
+      );
+
+      // Ambil nama produk untuk diringkas di pesan
+      const [detailItems] = await pool.query(
+        `SELECT p.name, poi.qty_pack, poi.price_per_pack
+         FROM purchase_order_items poi
+         JOIN products p ON p.id = poi.product_id
+         WHERE poi.purchase_order_id = ?`,
+        [po.insertId]
+      );
+
+      if (supplier?.phone) {
+        await sendPONotification(
+          supplier.phone,
+          supplier.name || 'Supplier',
+          code,
+          detailItems.map(d => ({
+            name: d.name,
+            qty_pack: Number(d.qty_pack),
+            price_per_pack: Number(d.price_per_pack)
+          })),
+          note || null
+        );
+      } else {
+        console.warn(`PO ${code}: supplier tidak punya nomor WA`);
+      }
+
+      // (Opsional) catat ke tabel notifications
+      await pool.query(
+        `INSERT INTO notifications (title, message, status)
+         VALUES (?,?,?)`,
+        [
+          `WA PO ${code}`,
+          `WA ke supplier ${supplier?.name || '-'} (${supplier?.phone || '-'}) terkirim`,
+          'sent'
+        ]
+      );
+    } catch (waErr) {
+      console.error('Gagal kirim WA PO:', waErr?.response?.data || waErr.message);
+      // (Opsional) catat failed
+      await pool.query(
+        `INSERT INTO notifications (title, message, status)
+         VALUES (?,?,?)`,
+        [
+          `WA PO ${code}`,
+          `Gagal kirim WA: ${waErr.message}`,
+          'failed'
+        ]
+      );
+    }
     res.status(201).json({ status:true, id: po.insertId, code });
   } catch (e) { await conn.rollback(); next(e); } finally { conn.release(); }
 };

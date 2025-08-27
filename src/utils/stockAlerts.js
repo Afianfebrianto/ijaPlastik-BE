@@ -1,16 +1,10 @@
-// src/utils/stockAlerts.js
 import { pool } from '../db.js';
 import { sendStokWarning } from './waGateway.js';
 
-/**
- * Ambil admin yang berhak menerima alert (view: vw_admin_wa_targets)
- */
 async function getAdminTargets() {
   const [rows] = await pool.query(`SELECT name, phone FROM vw_admin_wa_targets`);
-  // filter phone kosong/null
   return rows.filter(r => !!r.phone);
 }
-
 /**
  * Kirim WA alert untuk 1 produk dengan kondisi tertentu
  * @param {{id:number,name:string,stock_units:number,min_stock_units:number,max_stock_units:number}} prod

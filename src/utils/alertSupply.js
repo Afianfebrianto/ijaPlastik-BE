@@ -26,8 +26,6 @@ export async function sendPONotification(targetPhone, supplierName, poCode, item
   if (!FONNTE_TOKEN) throw new Error('FONNTE_TOKEN belum diset di .env');
   const phone = normalizePhoneTo62(targetPhone);
   if (!phone) throw new Error('Nomor WA supplier tidak valid/kosong');
-
-  // Susun ringkasan item (maks 8 baris agar tidak kepanjangan)
   const lines = items.slice(0, 8).map(it =>
     `• ${it.name} — ${Number(it.qty_pack).toLocaleString()} pack @ ${Number(it.price_per_pack).toLocaleString()}`
   );
@@ -44,9 +42,6 @@ Catatan: ${note || '-'}
 
 Mohon konfirmasi di sistem atau balas pesan ini.
 Terima kasih.`;
-
-  // Fonnte multi-variant pakai {name}, var1..var5 (opsional).
-  // Di sini cukup pakai {name}.
   const payload = new URLSearchParams({
     target: `${phone}|${supplierName}`,
     message,

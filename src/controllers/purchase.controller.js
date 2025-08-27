@@ -239,43 +239,195 @@ export const getPOById = async (req, res, next) => {
     }
 
     const [items] = await pool.query(
-      `SELECT poi.id, poi.product_id, p.name AS product_name,
-              poi.qty_pack, poi.price_per_pack, p.pack_size, p.unit_name
-       FROM purchase_order_items poi
-       JOIN products p ON p.id=poi.product_id
-       WHERE poi.purchase_order_id=?`,
-      [id]
-    );
+  `SELECT
+      poi.id,
+      poi.product_id,
+      p.name AS product_name,
+      poi.qty_pack,
+      poi.price_per_pack,
+      p.pack_size,
+      p.unit_name,
+      poi.supplier_decision,
+      poi.supplier_note,
+      poi.supplier_price_per_pack
+   FROM purchase_order_items poi
+   JOIN products p ON p.id=poi.product_id
+   WHERE poi.purchase_order_id=?`,
+  [id]
+);
 
     res.json({ status:true, po, items });
   } catch (e) { next(e); }
 };
 
+export const supplierDecideItems = async (req, res, next) => {
+  const poId = Number(req.params.id);
+  const { items = [] } = req.body; 
+  // items: [{ item_id, decision: 'send'|'nosend', note?: string }]
+
+  if (!poId) return res.status(400).json({ status:false, message:'PO id invalid' });
+  if (!Array.isArray(items) || !items.length) {
+    return res.status(400).json({ status:false, message:'items kosong' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // validasi user adalah supplier pemilik PO
+    const [[usr]] = await conn.query(`SELECT supplier_id FROM users WHERE id=?`, [req.user.id]);
+    if (!usr?.supplier_id) throw new Error('Akun supplier tidak terhubung ke supplier');
+
+    const [[po]] = await conn.query(
+      `SELECT supplier_id, status FROM purchase_orders WHERE id=? FOR UPDATE`,
+      [poId]
+    );
+    if (!po) return res.status(404).json({ status:false, message:'PO tidak ditemukan' });
+    if (po.supplier_id !== usr.supplier_id) return res.status(403).json({ status:false, message:'Forbidden' });
+    if (!['draft','sent','confirmed'].includes(po.status)) {
+      return res.status(400).json({ status:false, message:'PO tidak dapat diputuskan pada status ini' });
+    }
+
+    // update setiap item
+    for (const it of items) {
+      const itemId = Number(it.item_id);
+      const decision = String(it.decision || '').toLowerCase();
+      const note = (it.note || '').trim();
+
+      if (!itemId || !['send','nosend'].includes(decision)) {
+        await conn.rollback();
+        return res.status(400).json({ status:false, message:'Data item tidak valid' });
+      }
+
+      const [r] = await conn.query(
+        `UPDATE purchase_order_items
+         SET supplier_decision=?, supplier_note=?, supplier_decided_at=NOW()
+         WHERE id=? AND purchase_order_id=?`,
+        [decision, note || null, itemId, poId]
+      );
+      if (!r.affectedRows) {
+        await conn.rollback();
+        return res.status(400).json({ status:false, message:`Item ${itemId} tidak ditemukan` });
+      }
+    }
+
+    // opsional: jika semua sudah diputuskan dan minimal ada yg 'send', otomatis set PO -> 'confirmed'
+    const [[agg]] = await conn.query(
+      `SELECT 
+          SUM(supplier_decision='send') AS send_count,
+          SUM(supplier_decision='pending') AS pending_count
+       FROM purchase_order_items WHERE purchase_order_id=?`,
+      [poId]
+    );
+    if (agg?.pending_count === 0 && po.status !== 'received') {
+      await conn.query(
+        `UPDATE purchase_orders SET status='confirmed', updated_at=NOW() WHERE id=?`,
+        [poId]
+      );
+    }
+
+    await conn.commit();
+    res.json({ status:true, message:'Keputusan item tersimpan' });
+  } catch (e) {
+    try { await conn.rollback(); } catch {}
+    next(e);
+  } finally { conn.release(); }
+};
+
+
 export const supplierConfirmPO = async (req, res, next) => {
   const conn = await pool.getConnection();
   try {
     const id = req.params.id;
-    // validasi kepemilikan
+    const { decisions = [] } = req.body || {};
+
+    await conn.beginTransaction();
+
+    // validasi user supplier + lock PO
     const [[usr]] = await conn.query(`SELECT supplier_id FROM users WHERE id=?`, [req.user.id]);
     if (!usr?.supplier_id) throw new Error('Akun supplier belum terhubung ke organisasi supplier');
 
-    const [[po]] = await conn.query(`SELECT supplier_id, status FROM purchase_orders WHERE id=? FOR UPDATE`, [id]);
-    if (!po) return res.status(404).json({ status:false, message:'Not found' });
-    if (po.supplier_id !== usr.supplier_id) return res.status(403).json({ status:false, message:'Forbidden' });
-
-    if (po.status !== 'sent' && po.status !== 'draft') {
-      return res.status(400).json({ status:false, message:'PO tidak bisa dikonfirmasi pada status saat ini' });
+    const [[po]] = await conn.query(
+      `SELECT supplier_id, status FROM purchase_orders WHERE id=? FOR UPDATE`,
+      [id]
+    );
+    if (!po) { await conn.rollback(); return res.status(404).json({ status:false, message:'Not found' }); }
+    if (po.supplier_id !== usr.supplier_id) { await conn.rollback(); return res.status(403).json({ status:false, message:'Forbidden' }); }
+    if (!(po.status === 'sent' || po.status === 'draft')) {
+      await conn.rollback(); return res.status(400).json({ status:false, message:'PO tidak bisa dikonfirmasi pada status saat ini' });
     }
 
-    await conn.beginTransaction();
-    await conn.query(`UPDATE purchase_orders SET status='confirmed', updated_at=NOW() WHERE id=?`, [id]);
+    // Ambil list item valid untuk PO ini
+    const [poiRows] = await conn.query(
+      `SELECT id FROM purchase_order_items WHERE purchase_order_id=?`,
+      [id]
+    );
+    const validIds = new Set(poiRows.map(r => Number(r.id)));
+
+    // Normalisasi decisions
+    const normalized = (Array.isArray(decisions) ? decisions : [])
+      .map(d => ({
+        item_id: Number(d.purchase_item_id || d.item_id),
+        decision: String(d.decision || 'pending'),
+        note: d.note ? String(d.note) : '',
+        supplier_price_per_pack: d.supplier_price_per_pack != null ? Number(d.supplier_price_per_pack) : null
+      }))
+      .filter(d => validIds.has(d.item_id));
+
+    // Validasi: semua item harus ada keputusan dan tidak pending
+    // Untuk SEND, perlu harga > 0
+    // Kita buat map item_id -> decision record
+    const decMap = new Map(normalized.map(d => [d.item_id, d]));
+
+    // Pastikan semua item di PO punya entry
+    for (const r of poiRows) {
+      const d = decMap.get(Number(r.id));
+      if (!d || d.decision === 'pending') {
+        await conn.rollback();
+        return res.status(400).json({
+          status:false,
+          message:'Semua item harus diputuskan (tidak boleh pending)'
+        });
+      }
+      if (d.decision === 'send') {
+        if (!(d.supplier_price_per_pack > 0)) {
+          await conn.rollback();
+          return res.status(400).json({
+            status:false,
+            message:'Harga modal per pack wajib diisi untuk item yang dikirim'
+          });
+        }
+      } else {
+        // nosend: harga boleh null
+        d.supplier_price_per_pack = null;
+      }
+    }
+
+    // Simpan ke DB
+    for (const d of normalized) {
+      await conn.query(
+        `UPDATE purchase_order_items
+         SET supplier_decision=?, supplier_note=?, supplier_price_per_pack=?
+         WHERE id=?`,
+        [d.decision, d.note, d.supplier_price_per_pack, d.item_id]
+      );
+    }
+
+    // Update status PO -> confirmed
+    await conn.query(
+      `UPDATE purchase_orders SET status='confirmed', updated_at=NOW() WHERE id=?`,
+      [id]
+    );
+
     await conn.commit();
-    res.json({ status:true, message:'PO dikonfirmasi' });
+    res.json({ status:true, message:'PO dikonfirmasi & keputusan tersimpan' });
   } catch (e) {
-    await conn.rollback();
+    try { await conn.rollback(); } catch {}
     next(e);
   } finally { conn.release(); }
 };
+
+
 
 // List semua PO (ADMIN) dengan filter & pagination
 export const listAllPOs = async (req, res, next) => {
@@ -327,7 +479,7 @@ export const listAllPOs = async (req, res, next) => {
 export const getPurchaseReceiveDetail = async (req, res, next) => {
   try {
     const poId = Number(req.params.id);
-    if (!poId) return res.status(400).json({ status:false, message:'id invalid' });
+    if (!poId) return res.status(400).json({ status: false, message: 'id invalid' });
 
     // --- Header PO
     const [[purchase]] = await pool.query(
@@ -340,10 +492,10 @@ export const getPurchaseReceiveDetail = async (req, res, next) => {
       [poId]
     );
     if (!purchase) {
-      return res.status(404).json({ status:false, message:'PO tidak ditemukan' });
+      return res.status(404).json({ status: false, message: 'PO tidak ditemukan' });
     }
 
-    // --- Semua GRN untuk PO ini
+    // --- Semua GRN untuk PO ini (boleh kosong)
     const [grns] = await pool.query(
       `SELECT 
          gr.id,
@@ -357,16 +509,7 @@ export const getPurchaseReceiveDetail = async (req, res, next) => {
       [poId]
     );
 
-    // Jika belum ada GRN, kembalikan header saja
-    if (!grns.length) {
-      return res.json({
-        status: true,
-        purchase,
-        grns: [] // tidak ada penerimaan
-      });
-    }
-
-    // --- Item per GRN (tanpa IN clause ribet, filter via join ke grn_receipts)
+    // --- Item per GRN (boleh kosong)
     const [grnItems] = await pool.query(
       `SELECT
          gr.id AS grn_receipt_id,
@@ -383,24 +526,33 @@ export const getPurchaseReceiveDetail = async (req, res, next) => {
       [poId]
     );
 
+    // --- Ringkasan per purchase item (lengkap dgn kolom supplier)
     const [receivedSummary] = await pool.query(
-  `SELECT
-     poi.id AS purchase_item_id,
-     poi.product_id,
-     p.name AS product_name,
-     poi.qty_pack AS ordered_qty_pack,
-     COALESCE(SUM(gri.qty_pack), 0) AS received_qty_pack
-   FROM purchase_order_items poi
-   JOIN products p ON p.id = poi.product_id
-   LEFT JOIN grn_receipts gr ON gr.purchase_order_id = poi.purchase_order_id
-   LEFT JOIN grn_receipt_items gri 
-          ON gri.grn_receipt_id = gr.id
-         AND gri.product_id = poi.product_id
-   WHERE poi.purchase_order_id = ?
-   GROUP BY poi.id, poi.product_id, p.name, poi.qty_pack
-   ORDER BY poi.id ASC`,
-  [poId]
-);
+      `SELECT
+         poi.id AS purchase_item_id,
+         poi.product_id,
+         p.name AS product_name,
+         p.pack_size,
+         poi.qty_pack AS ordered_qty_pack,
+         COALESCE(SUM(gri.qty_pack), 0) AS received_qty_pack,
+         (poi.qty_pack - COALESCE(SUM(gri.qty_pack), 0)) AS remaining_qty_pack,
+         poi.supplier_price_per_pack,
+         poi.supplier_decision,
+         poi.supplier_note
+       FROM purchase_order_items poi
+       JOIN products p ON p.id = poi.product_id
+       LEFT JOIN grn_receipts gr 
+              ON gr.purchase_order_id = poi.purchase_order_id
+       LEFT JOIN grn_receipt_items gri 
+              ON gri.grn_receipt_id = gr.id
+             AND gri.product_id = poi.product_id
+       WHERE poi.purchase_order_id = ?
+       GROUP BY 
+         poi.id, poi.product_id, p.name, p.pack_size, poi.qty_pack,
+         poi.supplier_price_per_pack, poi.supplier_decision, poi.supplier_note
+       ORDER BY poi.id ASC`,
+      [poId]
+    );
 
     // Kelompokkan item berdasarkan GRN
     const itemMap = new Map();
@@ -428,19 +580,24 @@ export const getPurchaseReceiveDetail = async (req, res, next) => {
     res.json({
       status: true,
       purchase,
-      grns: grnWithItems,
+      grns: grnWithItems, // bisa [] kalau belum ada GRN
       summary_items: receivedSummary.map(r => ({
-    purchase_item_id: r.purchase_item_id,
-    product_id: r.product_id,
-    product_name: r.product_name,
-    ordered_qty_pack: Number(r.ordered_qty_pack),
-    received_qty_pack: Number(r.received_qty_pack),
-    remaining_qty_pack: Math.max(0, Number(r.ordered_qty_pack) - Number(r.received_qty_pack))
-  }))
+        purchase_item_id: r.purchase_item_id,
+        product_id: r.product_id,
+        product_name: r.product_name,
+        pack_size: Number(r.pack_size),
+        ordered_qty_pack: Number(r.ordered_qty_pack),
+        received_qty_pack: Number(r.received_qty_pack),
+        remaining_qty_pack: Math.max(0, Number(r.remaining_qty_pack)),
+        supplier_price_per_pack: r.supplier_price_per_pack != null ? Number(r.supplier_price_per_pack) : null,
+        supplier_decision: r.supplier_decision || 'pending',
+        supplier_note: r.supplier_note || ''
+      }))
     });
   } catch (e) {
     next(e);
   }
 };
+
 
 

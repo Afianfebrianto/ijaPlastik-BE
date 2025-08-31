@@ -9,7 +9,7 @@ r.post('/', verify, checkRole('admin'), createPO);
 r.post('/:id/send', verify, checkRole('admin'), sendPO);
 r.post('/:id/receive', verify, checkRole('admin'), receiveGRN);
 r.get('/', verify, checkRole('admin'), listAllPOs);
-r.get('/:id/receive-detail', verify, checkRole('admin'), getPurchaseReceiveDetail);
+r.get('/:id/receive-detail', verify, checkRole('admin','supplier'), getPurchaseReceiveDetail);
 
 // SUPPLIER
 r.get('/mine', verify, checkRole('supplier'), listMyPOs);
